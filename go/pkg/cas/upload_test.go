@@ -146,6 +146,12 @@ func TestFS(t *testing.T) {
 			wantScheduledChecks: []*uploadItem{rootWithoutAItem, bItem, subdirItem, cItem},
 		},
 		{
+			desc:                "root-without-a-using-allowlist",
+			inputs:              []*UploadInput{{Path: filepath.Join(tmpDir, "root"), Allowlist: []string{"b", "subdir"}}},
+			wantDigests:         digSlice(rootWithoutAItem),
+			wantScheduledChecks: []*uploadItem{rootWithoutAItem, bItem, subdirItem, cItem},
+		},
+		{
 			desc: "root-without-b-using-exclude",
 			inputs: []*UploadInput{{
 				Path:    filepath.Join(tmpDir, "root"),
@@ -448,9 +454,10 @@ func TestSmallFiles(t *testing.T) {
 }
 
 func TestStreaming(t *testing.T) {
-	// TODO(nodir): add tests for retries.
 	t.Parallel()
 	ctx := context.Background()
+
+	// TODO(nodir): add tests for retries.
 
 	e, cleanup := fakes.NewTestEnv(t)
 	defer cleanup()
@@ -502,6 +509,169 @@ func TestStreaming(t *testing.T) {
 	// Upload the large file again.
 	if _, err := client.Upload(ctx, UploadOptions{}, uploadInputChanFrom(&UploadInput{Path: largeFilePath})); err != nil {
 		t.Fatalf("failed to upload: %s", err)
+	}
+}
+
+func TestMissingAncestors(t *testing.T) {
+	t.Parallel()
+
+	mustDigest := func(m proto.Message) *repb.Digest {
+		d, err := digest.NewFromMessage(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.ToProto()
+	}
+
+	barDigest := digest.NewFromBlob([]byte("bar")).ToProto()
+	bazDigest := mustDigest(&repb.Directory{})
+
+	foo := &repb.Directory{
+		Files: []*repb.FileNode{{
+			Name:   "bar",
+			Digest: barDigest,
+		}},
+		Directories: []*repb.DirectoryNode{{
+			Name:   "baz",
+			Digest: bazDigest,
+		}},
+	}
+
+	root := &repb.Directory{
+		Directories: []*repb.DirectoryNode{{
+			Name:   "foo",
+			Digest: mustDigest(foo),
+		}},
+	}
+
+	testCases := []struct {
+		desc      string
+		tree      map[string]*digested
+		wantItems []*uploadItem
+	}{
+		{
+			desc: "works",
+			tree: map[string]*digested{
+				"foo/bar": {
+					dirEntry: &repb.FileNode{
+						Name:   "bar",
+						Digest: barDigest,
+					},
+					digest: barDigest,
+				},
+				"foo/baz": {
+					dirEntry: &repb.DirectoryNode{
+						Name:   "baz",
+						Digest: bazDigest,
+					},
+					digest: bazDigest,
+				},
+			},
+			wantItems: []*uploadItem{
+				uploadItemFromDirMsg("/", root),
+				uploadItemFromDirMsg("/foo", foo),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		in := &UploadInput{
+			tree:      tc.tree,
+			cleanPath: "/",
+		}
+		gotItems := in.partialMerkleTree()
+		sort.Slice(gotItems, func(i, j int) bool {
+			return gotItems[i].Title < gotItems[j].Title
+		})
+
+		if diff := cmp.Diff(tc.wantItems, gotItems, cmp.Comparer(compareUploadItems)); diff != "" {
+			t.Errorf("unexpected digests (-want +got):\n%s", diff)
+		}
+	}
+}
+
+func TestUploadInputInit(t *testing.T) {
+	t.Parallel()
+	absPath := filepath.Join(t.TempDir(), "foo")
+	testCases := []struct {
+		desc               string
+		in                 *UploadInput
+		dir                bool
+		wantCleanAllowlist []string
+		wantErrContain     string
+	}{
+		{
+			desc: "valid",
+			in:   &UploadInput{Path: absPath},
+		},
+		{
+			desc:           "relative path",
+			in:             &UploadInput{Path: "foo"},
+			wantErrContain: "not absolute",
+		},
+		{
+			desc:           "relative path",
+			in:             &UploadInput{Path: "foo"},
+			wantErrContain: "not absolute",
+		},
+		{
+			desc:           "regular file with allowlist",
+			in:             &UploadInput{Path: absPath, Allowlist: []string{"x"}},
+			wantErrContain: "the Allowlist is not supported for regular files",
+		},
+		{
+			desc:               "not clean allowlisted path",
+			in:                 &UploadInput{Path: absPath, Allowlist: []string{"bar/"}},
+			dir:                true,
+			wantCleanAllowlist: []string{"bar"},
+		},
+		{
+			desc:           "absolute allowlisted path",
+			in:             &UploadInput{Path: absPath, Allowlist: []string{"/bar"}},
+			dir:            true,
+			wantErrContain: "not relative",
+		},
+		{
+			desc:           "parent dir in allowlisted path",
+			in:             &UploadInput{Path: absPath, Allowlist: []string{"bar/../.."}},
+			dir:            true,
+			wantErrContain: "..",
+		},
+		{
+			desc:               "no allowlist",
+			in:                 &UploadInput{Path: absPath},
+			dir:                true,
+			wantCleanAllowlist: []string{"."},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			tmpFilePath := absPath
+			if tc.dir {
+				tmpFilePath = filepath.Join(absPath, "bar")
+			}
+			putFile(t, tmpFilePath, "")
+			defer os.RemoveAll(absPath)
+
+			err := tc.in.init(&uploader{})
+			if tc.wantErrContain == "" {
+				if err != nil {
+					t.Error(err)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrContain) {
+					t.Errorf("expected err to contain %q; got %v", tc.wantErrContain, err)
+				}
+			}
+
+			if len(tc.wantCleanAllowlist) != 0 {
+				if diff := cmp.Diff(tc.wantCleanAllowlist, tc.in.cleanAllowlist); diff != "" {
+					t.Errorf("unexpected cleanAllowlist (-want +got):\n%s", diff)
+				}
+			}
+		})
 	}
 }
 
