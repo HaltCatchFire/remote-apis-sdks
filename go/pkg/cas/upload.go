@@ -464,14 +464,14 @@ func (u *uploader) startProcessing(ctx context.Context, in *UploadInput) error {
 					}
 				}
 
-				dig, err := u.visitPath(ctx, absPath, info, in.Exclude)
-				if err != nil {
+				switch dig, err := u.visitPath(ctx, absPath, info, in.Exclude); {
+				case err != nil:
 					return errors.Wrapf(err, "%q", absPath)
+				case dig != nil:
+					treeMu.Lock()
+					in.tree[relPath] = dig
+					treeMu.Unlock()
 				}
-
-				treeMu.Lock()
-				in.tree[relPath] = dig
-				treeMu.Unlock()
 				return nil
 			})
 		}
