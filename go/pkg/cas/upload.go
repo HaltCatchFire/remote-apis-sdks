@@ -184,7 +184,7 @@ func (in *UploadInput) init(u *uploader) error {
 
 			cleanSubPath := filepath.Clean(subPath)
 			if cleanSubPath == ".." || strings.HasPrefix(cleanSubPath, parentDirPrefix) {
-				return errors.Errorf("the allowlisted path %q contains `..`", subPath)
+				return errors.Errorf("the allowlisted path %q is not contained by %q", subPath, in.Path)
 			}
 			in.cleanAllowlist[i] = cleanSubPath
 		}
